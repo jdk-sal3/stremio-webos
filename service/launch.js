@@ -3,6 +3,7 @@ require('module').Module._initPaths();
 process.env.APP_PATH = process.env.APP_PATH || __dirname;
 
 var http = require('http');
+var https = require('https');
 var fs = require('fs');
 var path = require('path');
 var Service = require('webos-service');
@@ -59,9 +60,32 @@ function proxyToStreaming(req, res) {
     req.pipe(proxy);
 }
 
+// TMDB fallback proxy: /__tmdb/3/... -> https://api.themoviedb.org/3/...
+// Used by www/autolang.js only when the browser can't reach TMDB directly
+// (e.g. TLS/CA issues on older webOS Chromium). GET-only, fixed host.
+function proxyTmdb(req, res) {
+    var rest = req.url.substring('/__tmdb'.length);
+    if (req.method !== 'GET' || rest.indexOf('/3/') !== 0) { res.writeHead(400); res.end(); return; }
+    var finished = false;
+    function fail(code) {
+        if (finished) return;
+        finished = true;
+        try { if (!res.headersSent) res.writeHead(code); res.end(); } catch (_) {}
+    }
+    var preq = https.get({ hostname: 'api.themoviedb.org', path: rest, headers: { 'Accept': 'application/json' } }, function(pres) {
+        if (finished) { pres.resume(); return; }
+        finished = true;
+        res.writeHead(pres.statusCode, { 'Content-Type': 'application/json' });
+        pres.pipe(res);
+    });
+    preq.setTimeout(8000, function() { preq.abort(); fail(504); });
+    preq.on('error', function() { fail(502); });
+}
+
 // Single server: static files first, then proxy to streaming server
 http.createServer(function(req, res) {
     var urlPath = req.url.split('?')[0];
+    if (urlPath.indexOf('/__tmdb/') === 0) return proxyTmdb(req, res);
     serveStatic(urlPath, res, function() { proxyToStreaming(req, res); });
 }).listen(8080, function() {
     ready = true;
