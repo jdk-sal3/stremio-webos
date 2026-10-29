@@ -8,6 +8,13 @@ FFMPEG_URL = https://johnvansickle.com/ffmpeg/releases/ffmpeg-$(FFMPEG_VERSION)-
 FFMPEG_SHA256 = f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1
 VERSION = $(shell python3 -c "import json; print(json.load(open('app/appinfo.json'))['version'])")
 IPK = $(APP_ID)_$(VERSION)_all.ipk
+# TMDB API key (used to look up a title's original language for audio
+# selection). Injected into service/www/autolang.js at build time from
+# $TMDB_API_KEY or the gitignored file .tmdb_key — never committed.
+TMDB_KEY_FILE = .tmdb_key
+TMDB_KEY_SH = KEY="$${TMDB_API_KEY:-}"; \
+	if [ -z "$$KEY" ] && [ -f $(TMDB_KEY_FILE) ]; then KEY="$$(tr -d ' \t\r\n' < $(TMDB_KEY_FILE))"; fi; \
+	if [ -z "$$KEY" ]; then echo "ERROR: TMDB API key missing. Set TMDB_API_KEY=... or put the key in $(TMDB_KEY_FILE) (gitignored)." >&2; exit 1; fi
 
 .PHONY: build package deploy launch restart clean
 
@@ -26,6 +33,7 @@ service/bin/ffmpeg service/bin/ffprobe:
 	@rm -rf /tmp/stremio-ffmpeg
 
 build: service/server.js service/bin/ffmpeg service/bin/ffprobe
+	@$(TMDB_KEY_SH)
 	@echo "==> Downloading Vidaa frontend..."
 	@rm -rf /tmp/stremio-vidaa-build && mkdir -p /tmp/stremio-vidaa-build
 	@curl -sL $(VIDAA_REPO) | tar xz --strip-components=1 -C /tmp/stremio-vidaa-build
@@ -36,8 +44,11 @@ build: service/server.js service/bin/ffmpeg service/bin/ffprobe
 	@rm -rf /tmp/stremio-vidaa-build
 	@for p in patches/*.patch; do \
 		echo "    Applying $$(basename $$p)..."; \
-		patch -p0 -d service/www < "$$p"; \
+		patch -p0 -d service/www < "$$p" || exit 1; \
 	done
+	@echo "==> Injecting TMDB API key into autolang.js..."
+	@$(TMDB_KEY_SH); \
+	TMDB_KEY_VALUE="$$KEY" python3 -c 'import os,sys; p="service/www/autolang.js"; s=open(p).read(); n=s.count("__TMDB_API_KEY__"); sys.exit("ERROR: __TMDB_API_KEY__ placeholder not found in "+p) if n!=1 else open(p,"w").write(s.replace("__TMDB_API_KEY__", os.environ["TMDB_KEY_VALUE"]))'
 	@echo "==> Build complete"
 
 package: build
