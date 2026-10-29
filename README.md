@@ -14,6 +14,22 @@ Built from [Stremio Theater v1.9.2](https://github.com/NoobyGains/stremio-vidaa-
 
 > **Note:** Developer Mode expires after 1000 hours and any sideloaded apps will be uninstalled. Rooted TVs with Homebrew Channel do not have this limitation.
 
+## Automatic subtitles and audio
+
+- **Subtitles** are always turned on, in English. A track whose label, name or file name contains the word `SDH` (for example `SDH`, `[SDH]`, `.sdh.`) is preferred. `CC` alone does not count as SDH. If there is no English SDH track, the first plain (non-forced) English track is used. This works for embedded tracks and for addon subtitles, including addon subtitles that arrive late. Once you pick a subtitle in the player menu, your choice is kept.
+- **Audio** follows the title's original language, taken from TMDB's `original_language` and looked up by IMDb id. The result is cached in `localStorage`. If TMDB has no answer, or is slow or unreachable, the player falls back to your Stremio audio-language setting and then to the stream's default track. Playback never waits on TMDB.
+
+### TMDB API key
+
+The TMDB key is **injected at build time**. It is never stored in git. Provide it in one of two ways:
+
+```sh
+TMDB_API_KEY=your_key make package    # environment variable
+echo your_key > .tmdb_key             # or a gitignored file in the repo root
+```
+
+`make build` fails with a clear error if no key is found. The key ends up inside the built IPK (`www/autolang.js`), so do not publish IPKs built with a private key. If the TV cannot reach TMDB directly, requests go through the local service proxy at `/__tmdb/`.
+
 ## Install via Homebrew Channel
 
 If your TV is rooted with [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel):
@@ -35,7 +51,7 @@ Replace the default device name if needed: `make deploy DEVICE=myTV`
 ### Other commands
 
 ```sh
-make build     # Download dependencies + build (no install)
+make build     # Download dependencies + build (no install; needs TMDB_API_KEY)
 make package   # Build + create IPK
 make restart   # Close + relaunch on TV
 make clean     # Remove build artifacts
