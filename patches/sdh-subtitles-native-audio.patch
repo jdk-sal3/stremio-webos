@@ -1,0 +1,650 @@
+--- /dev/null
++++ autolang.js
+@@ -0,0 +1,498 @@
++/*
++ * autolang.js - automatic subtitle / audio track selection for Stremio webOS.
++ *
++ * Subtitles: always on, English; prefer an English track whose label/name
++ * contains the word "SDH"; otherwise the first plain English track.
++ * Audio: prefer the title's original language (TMDB original_language),
++ * then the profile's audioLanguage, else leave the default track.
++ *
++ * Written in ES5 for webOS Chromium 68. Exposed as window.__autoLang.
++ */
++(function(root) {
++    "use strict";
++
++    var TMDB_API_KEY = "__TMDB_API_KEY__";
++    var TMDB_BASE = "https://api.themoviedb.org";
++    var TMDB_PROXY_BASE = "/__tmdb";
++    var TMDB_TIMEOUT_MS = 4000;
++    var CACHE_KEY = "autolang.tmdb.v1";
++    var CACHE_MAX = 500;
++    var CACHE_TTL_FOUND = 180 * 24 * 3600 * 1000;
++    var CACHE_TTL_MISSING = 3 * 24 * 3600 * 1000;
++
++    // ISO 639-1 -> other codes / names that identify the same language.
++    // Includes ISO 639-2/B, 639-2/T, 639-3 variants and English/native names.
++    var LANGS = {
++        en: ["eng", "english"],
++        es: ["spa", "spanish", "espanol", "español", "castellano", "castilian"],
++        fr: ["fra", "fre", "french", "francais", "français"],
++        de: ["deu", "ger", "german", "deutsch"],
++        it: ["ita", "italian", "italiano"],
++        pt: ["por", "portuguese", "portugues", "português"],
++        ja: ["jpn", "japanese"],
++        ko: ["kor", "korean"],
++        zh: ["zho", "chi", "cmn", "chinese", "mandarin"],
++        cn: ["yue", "cantonese"],
++        ru: ["rus", "russian"],
++        hi: ["hin", "hindi"],
++        ar: ["ara", "arabic"],
++        tr: ["tur", "turkish"],
++        pl: ["pol", "polish"],
++        nl: ["nld", "dut", "dutch"],
++        sv: ["swe", "swedish"],
++        da: ["dan", "danish"],
++        no: ["nor", "nob", "nno", "nb", "nn", "norwegian"],
++        fi: ["fin", "finnish"],
++        cs: ["ces", "cze", "czech"],
++        el: ["ell", "gre", "greek"],
++        he: ["heb", "iw", "hebrew"],
++        th: ["tha", "thai"],
++        id: ["ind", "in", "indonesian"],
++        ms: ["msa", "may", "zsm", "malay"],
++        vi: ["vie", "vietnamese"],
++        uk: ["ukr", "ukrainian"],
++        hu: ["hun", "hungarian"],
++        ro: ["ron", "rum", "mo", "romanian"],
++        ta: ["tam", "tamil"],
++        te: ["tel", "telugu"],
++        ml: ["mal", "malayalam"],
++        kn: ["kan", "kannada"],
++        bn: ["ben", "bengali", "bangla"],
++        mr: ["mar", "marathi"],
++        pa: ["pan", "punjabi"],
++        gu: ["guj", "gujarati"],
++        ur: ["urd", "urdu"],
++        fa: ["fas", "per", "persian", "farsi"],
++        tl: ["tgl", "fil", "tagalog", "filipino"],
++        is: ["isl", "ice", "icelandic"],
++        et: ["est", "estonian"],
++        lv: ["lav", "latvian"],
++        lt: ["lit", "lithuanian"],
++        sk: ["slk", "slo", "slovak"],
++        sl: ["slv", "slovenian", "slovene"],
++        hr: ["hrv", "croatian"],
++        sr: ["srp", "serbian"],
++        bs: ["bos", "bosnian"],
++        bg: ["bul", "bulgarian"],
++        mk: ["mkd", "mac", "macedonian"],
++        sq: ["sqi", "alb", "albanian"],
++        ka: ["kat", "geo", "georgian"],
++        hy: ["hye", "arm", "armenian"],
++        ca: ["cat", "catalan"],
++        eu: ["eus", "baq", "basque"],
++        gl: ["glg", "galician"],
++        cy: ["cym", "wel", "welsh"],
++        ga: ["gle", "irish"],
++        af: ["afr", "afrikaans"],
++        sw: ["swa", "swahili"],
++        zu: ["zul", "zulu"],
++        xh: ["xho", "xhosa"],
++        am: ["amh", "amharic"],
++        km: ["khm", "khmer"],
++        lo: ["lao"],
++        my: ["mya", "bur", "burmese"],
++        ne: ["nep", "nepali"],
++        si: ["sin", "sinhala"],
++        mn: ["mon", "mongolian"],
++        kk: ["kaz", "kazakh"],
++        uz: ["uzb", "uzbek"],
++        az: ["aze", "azerbaijani"],
++        be: ["bel", "belarusian"],
++        la: ["lat", "latin"],
++        yi: ["yid", "yiddish"],
++        ku: ["kur", "kurdish"],
++        ps: ["pus", "pashto"],
++        so: ["som", "somali"],
++        yo: ["yor", "yoruba"],
++        ha: ["hau", "hausa"],
++        mt: ["mlt", "maltese"],
++        lb: ["ltz", "luxembourgish"],
++        bo: ["bod", "tib", "tibetan"],
++        mi: ["mri", "mao", "maori"],
++        wo: ["wol", "wolof"],
++        dz: ["dzo", "dzongkha"]
++    };
++    var ALIAS = {};
++    (function() {
++        for (var k in LANGS) {
++            if (!LANGS.hasOwnProperty(k)) continue;
++            ALIAS[k] = k;
++            for (var i = 0; i < LANGS[k].length; i++) ALIAS[LANGS[k][i]] = k;
++        }
++        // TMDB-specific / legacy codes
++        ALIAS.sh = "sr"; // Serbo-Croatian
++        ALIAS.scc = "sr"; ALIAS.scr = "hr";
++    })();
++
++    function normLang(code) {
++        if (typeof code !== "string") return "";
++        var c = code.replace(/^\s+|\s+$/g, "").toLowerCase();
++        if (!c || c === "und" || c === "unk" || c === "mul" || c === "zxx" || c === "xx" || c === "mis") return "";
++        if (ALIAS.hasOwnProperty(c)) return ALIAS[c];
++        // Region / script subtags: es-419, pt_BR, zh-Hant, en-US
++        var base = c.split(/[-_ .]/)[0];
++        if (base && ALIAS.hasOwnProperty(base)) return ALIAS[base];
++        return c;
++    }
++
++    function langMatches(a, b) {
++        var na = normLang(a), nb = normLang(b);
++        if (!na || !nb) return false;
++        return na === nb;
++    }
++
++    // Language codes that TMDB returns, expanded into the list of codes we try
++    // in order (e.g. Cantonese "cn" -> yue first, then generic Chinese).
++    function originalLangCandidates(tmdbLang) {
++        var n = normLang(tmdbLang);
++        if (!n) return [];
++        if (n === "cn") return ["cn", "zh"];
++        return [n];
++    }
++
++    // ---- subtitle helpers ----------------------------------------------------
++
++    function wordRe(word) {
++        return new RegExp("(^|[^a-z0-9])" + word + "([^a-z0-9]|$)", "i");
++    }
++    var SDH_RE = wordRe("sdh");
++    var FORCED_RE = wordRe("forced");
++    var ENGLISH_RE = wordRe("english");
++
++    function urlName(url) {
++        if (typeof url !== "string" || !url) return "";
++        var s = url.split("?")[0].split("#")[0];
++        s = s.substring(s.lastIndexOf("/") + 1);
++        try { s = decodeURIComponent(s); } catch (e) {}
++        return s;
++    }
++
++    // Text fields of a track that may carry the "SDH" marker.
++    function trackTexts(t) {
++        var out = [];
++        if (!t) return out;
++        if (typeof t.label === "string") out.push(t.label);
++        if (typeof t.rawLabel === "string") out.push(t.rawLabel);
++        if (typeof t.name === "string") out.push(t.name);
++        if (typeof t.title === "string") out.push(t.title);
++        if (typeof t.id === "string") out.push(t.id);
++        var u = urlName(t.url);
++        if (u) out.push(u);
++        return out;
++    }
++
++    function anyMatch(re, texts) {
++        for (var i = 0; i < texts.length; i++) if (re.test(texts[i])) return true;
++        return false;
++    }
++
++    function isSDH(t) { return anyMatch(SDH_RE, trackTexts(t)); }
++    function isForced(t) { return anyMatch(FORCED_RE, trackTexts(t)); }
++
++    function isEnglish(t) {
++        if (!t) return false;
++        var n = normLang(t.lang);
++        if (n) return n === "en";
++        var texts = [];
++        if (typeof t.label === "string") texts.push(t.label);
++        if (typeof t.rawLabel === "string") texts.push(t.rawLabel);
++        return anyMatch(ENGLISH_RE, texts);
++    }
++
++    // 4 = English SDH, 3 = English, 2 = English forced, 1 = fallback language, 0 = no match
++    function subtitleRank(t, fallbackLang) {
++        if (isEnglish(t)) {
++            if (isSDH(t)) return 4;
++            if (isForced(t)) return 2;
++            return 3;
++        }
++        if (fallbackLang && langMatches(t && t.lang, fallbackLang)) return 1;
++        return 0;
++    }
++
++    function pickSubtitle(embedded, extra, fallbackLang) {
++        var best = null;
++        function scan(list, isExtra) {
++            if (!list || !list.length) return;
++            for (var i = 0; i < list.length; i++) {
++                var t = list[i];
++                if (!t || typeof t.id !== "string") continue;
++                var r = subtitleRank(t, fallbackLang);
++                if (r > 0 && (!best || r > best.rank)) best = { id: t.id, extra: isExtra, rank: r };
++            }
++        }
++        scan(embedded, false);
++        scan(extra, true);
++        return best;
++    }
++
++    function findById(list, id) {
++        if (!list || !id) return null;
++        for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === id) return list[i];
++        return null;
++    }
++
++    // Per-load state. Reset by beginLoad().
++    var subsState = { manual: false, rank: 0, id: null };
++    var audioState = { manual: false };
++
++    function markManualSubs() { subsState.manual = true; }
++    function markManualAudio() { audioState.manual = true; }
++    function audioManual() { return audioState.manual; }
++
++    /*
++     * Decide which subtitle track (if any) should be selected now.
++     * Called every time the player's track lists change. Returns
++     * {id, extra} to select, or null to do nothing. Upgrades the automatic
++     * choice when a better track shows up later (e.g. addon SDH subtitles
++     * arriving after embedded ones) and stops once the user picked manually.
++     *   saved: streamState.subtitleTrack ({id, embedded}) - a previous manual
++     *          choice for this stream; honoured when present in the lists.
++     */
++    function decideSubtitles(embedded, extra, fallbackLang, saved) {
++        if (subsState.manual) return null;
++        if (saved && saved.id) {
++            var inList = saved.embedded ? findById(embedded, saved.id) : findById(extra, saved.id);
++            if (inList) {
++                subsState.manual = true;
++                return { id: saved.id, extra: !saved.embedded, rank: 99, restored: true };
++            }
++        }
++        var pick = pickSubtitle(embedded, extra, fallbackLang);
++        if (!pick || pick.rank <= subsState.rank) return null;
++        subsState.rank = pick.rank;
++        subsState.id = pick.id;
++        return pick;
++    }
++
++    // ---- audio helpers -------------------------------------------------------
++
++    // langs: array of track language codes (index = native track index).
++    // prefs: preference list of language codes, first wins.
++    function pickAudioIndex(langs, prefs) {
++        if (!langs || !langs.length || !prefs) return -1;
++        for (var p = 0; p < prefs.length; p++) {
++            var cands = originalLangCandidates(prefs[p]);
++            for (var c = 0; c < cands.length; c++) {
++                for (var i = 0; i < langs.length; i++) {
++                    if (langMatches(langs[i], cands[c])) return i;
++                }
++            }
++            // Legacy behaviour for unrecognised codes: exact / 2-letter prefix
++            if (!cands.length && typeof prefs[p] === "string" && prefs[p]) {
++                for (var j = 0; j < langs.length; j++) {
++                    var tl = (langs[j] || "").toLowerCase(), pl = prefs[p].toLowerCase();
++                    if (tl && (tl === pl || tl.substring(0, 2) === pl.substring(0, 2))) return j;
++                }
++            }
++        }
++        return -1;
++    }
++
++    function profileAudioLang() {
++        try {
++            var p = JSON.parse(root.localStorage.getItem("profile"));
++            return p && p.settings && p.settings.audioLanguage ? p.settings.audioLanguage : null;
++        } catch (e) { return null; }
++    }
++
++    // ---- TMDB lookup ---------------------------------------------------------
++
++    var current = { imdb: null, type: null, lang: null, done: false, waiters: [] };
++
++    function imdbIdOf(id) {
++        if (typeof id !== "string") return null;
++        var m = /^(tt\d+)/.exec(id);
++        return m ? m[1] : null;
++    }
++
++    function cacheLoad() {
++        try {
++            var c = JSON.parse(root.localStorage.getItem(CACHE_KEY));
++            return c && typeof c === "object" ? c : {};
++        } catch (e) { return {}; }
++    }
++
++    function cacheSave(c) {
++        try {
++            var keys = Object.keys(c);
++            if (keys.length > CACHE_MAX) {
++                keys.sort(function(a, b) { return (c[a].t || 0) - (c[b].t || 0); });
++                for (var i = 0; i < keys.length - CACHE_MAX; i++) delete c[keys[i]];
++            }
++            root.localStorage.setItem(CACHE_KEY, JSON.stringify(c));
++        } catch (e) {}
++    }
++
++    function cacheGet(imdb) {
++        var e = cacheLoad()[imdb];
++        if (!e || typeof e.t !== "number") return undefined;
++        var ttl = e.l ? CACHE_TTL_FOUND : CACHE_TTL_MISSING;
++        if (Date.now() - e.t > ttl) return undefined;
++        return e.l || "";
++    }
++
++    function cachePut(imdb, lang) {
++        var c = cacheLoad();
++        c[imdb] = { l: lang || "", t: Date.now() };
++        cacheSave(c);
++    }
++
++    function keyAvailable() {
++        return typeof TMDB_API_KEY === "string" && TMDB_API_KEY.length > 0 && TMDB_API_KEY.indexOf("__") !== 0;
++    }
++
++    function xhrJson(url, cb) {
++        var done = false;
++        function finish(err, data) { if (!done) { done = true; cb(err, data); } }
++        try {
++            var x = new root.XMLHttpRequest();
++            x.open("GET", url, true);
++            x.timeout = TMDB_TIMEOUT_MS;
++            x.onreadystatechange = function() {
++                if (x.readyState !== 4) return;
++                if (x.status >= 200 && x.status < 300) {
++                    try { finish(null, JSON.parse(x.responseText)); } catch (e) { finish(e); }
++                } else {
++                    finish(new Error("HTTP " + x.status), { status: x.status });
++                }
++            };
++            x.ontimeout = function() { finish(new Error("timeout")); };
++            x.onerror = function() { finish(new Error("network")); };
++            x.send();
++            // Belt and braces in case timeout isn't honoured.
++            setTimeout(function() { if (!done) { try { x.abort(); } catch (e) {} finish(new Error("timeout")); } }, TMDB_TIMEOUT_MS + 500);
++        } catch (e) { finish(e); }
++    }
++
++    // GET a TMDB v3 path; tries the API directly, then via the local proxy.
++    function tmdbGet(path, cb) {
++        var q = (path.indexOf("?") >= 0 ? "&" : "?") + "api_key=" + encodeURIComponent(TMDB_API_KEY);
++        xhrJson(TMDB_BASE + path + q, function(err, data) {
++            if (!err) return cb(null, data);
++            // 4xx means the request reached TMDB (bad key / not found): no retry.
++            if (data && data.status >= 400 && data.status < 500) return cb(err);
++            xhrJson(TMDB_PROXY_BASE + path + q, cb);
++        });
++    }
++
++    function originalLangFromFind(data, type) {
++        if (!data) return null;
++        var order = type === "series" ? ["tv_results", "movie_results"] : ["movie_results", "tv_results"];
++        for (var i = 0; i < order.length; i++) {
++            var r = data[order[i]];
++            if (r && r.length && r[0] && typeof r[0].original_language === "string" && r[0].original_language) {
++                return r[0].original_language;
++            }
++        }
++        return null;
++    }
++
++    function finishLookup(imdb, lang, cacheIt) {
++        if (cacheIt) cachePut(imdb, lang);
++        if (current.imdb !== imdb) return;
++        current.lang = lang || null;
++        current.done = true;
++        var w = current.waiters;
++        current.waiters = [];
++        for (var i = 0; i < w.length; i++) {
++            try { w[i](current.lang); } catch (e) {}
++        }
++    }
++
++    function lookup(imdb, type) {
++        var cached = cacheGet(imdb);
++        if (cached !== undefined) { finishLookup(imdb, cached, false); return; }
++        if (!keyAvailable() || !root.XMLHttpRequest) { finishLookup(imdb, null, false); return; }
++        tmdbGet("/3/find/" + encodeURIComponent(imdb) + "?external_source=imdb_id", function(err, data) {
++            if (err) {
++                // 4xx other than auth: cache as missing; network errors: don't cache.
++                finishLookup(imdb, null, false);
++                return;
++            }
++            var lang = originalLangFromFind(data, type);
++            if (lang) return finishLookup(imdb, lang, true);
++            var ep = data && data.tv_episode_results && data.tv_episode_results[0];
++            if (ep && ep.show_id) {
++                tmdbGet("/3/tv/" + encodeURIComponent(ep.show_id), function(err2, show) {
++                    var l2 = !err2 && show && show.original_language ? show.original_language : null;
++                    finishLookup(imdb, l2, !err2);
++                });
++                return;
++            }
++            finishLookup(imdb, null, true);
++        });
++    }
++
++    /*
++     * Called by the player right before a stream is loaded. `selected` is the
++     * player's selected item ({streamRequest, metaRequest, ...}). Resets the
++     * per-load state and starts the TMDB lookup (non-blocking).
++     */
++    function beginLoad(selected) {
++        subsState = { manual: false, rank: 0, id: null };
++        audioState = { manual: false };
++        var metaId = null, videoId = null, type = null;
++        try { metaId = selected.metaRequest.path.id; type = selected.metaRequest.path.type; } catch (e) {}
++        try { videoId = selected.streamRequest.path.id; if (!type) type = selected.streamRequest.path.type; } catch (e) {}
++        var imdb = imdbIdOf(metaId) || imdbIdOf(videoId);
++        current = { imdb: imdb, type: type, lang: null, done: !imdb, waiters: [] };
++        if (imdb) {
++            try { lookup(imdb, type); } catch (e) { finishLookup(imdb, null, false); }
++        }
++    }
++
++    // Original language of the current title if already known, else null.
++    function originalLang() { return current.done ? current.lang : null; }
++    function lookupPending() { return !!current.imdb && !current.done; }
++
++    // Run cb(lang) once the lookup for the current title finishes. Only one
++    // waiter per `slot` is kept (track handlers may fire repeatedly).
++    function onOriginalLang(cb, slot) {
++        if (current.done) { try { cb(current.lang); } catch (e) {} return; }
++        if (slot) {
++            for (var i = 0; i < current.waiters.length; i++) {
++                if (current.waiters[i].__slot === slot) current.waiters.splice(i--, 1);
++            }
++            cb.__slot = slot;
++        }
++        current.waiters.push(cb);
++    }
++
++    // Audio preference list: TMDB original language -> profile audioLanguage.
++    function audioPrefs(extraFallback) {
++        var prefs = [];
++        var o = originalLang();
++        if (o) prefs.push(o);
++        var p = profileAudioLang();
++        if (p) prefs.push(p);
++        if (extraFallback) prefs.push(extraFallback);
++        return prefs;
++    }
++
++    var api = {
++        normLang: normLang,
++        langMatches: langMatches,
++        isSDH: isSDH,
++        isForced: isForced,
++        isEnglish: isEnglish,
++        subtitleRank: subtitleRank,
++        pickSubtitle: pickSubtitle,
++        decideSubtitles: decideSubtitles,
++        markManualSubs: markManualSubs,
++        markManualAudio: markManualAudio,
++        audioManual: audioManual,
++        pickAudioIndex: pickAudioIndex,
++        audioPrefs: audioPrefs,
++        profileAudioLang: profileAudioLang,
++        imdbIdOf: imdbIdOf,
++        originalLangFromFind: originalLangFromFind,
++        beginLoad: beginLoad,
++        originalLang: originalLang,
++        lookupPending: lookupPending,
++        onOriginalLang: onOriginalLang,
++        keyAvailable: keyAvailable
++    };
++    if (typeof module !== "undefined" && module.exports) module.exports = api;
++    root.__autoLang = api;
++})(typeof window !== "undefined" ? window : this);
+--- index.html
++++ index.html
+@@ -12,6 +12,7 @@
+             }).catch(function(){});
+         }
+     </script>
++    <script src="autolang.js"></script>
+     <script defer src="runtime.js"></script>
+     <script defer src="main.js"></script>
+     <script defer src="service.js"></script>
+--- player.chunk.js
++++ player.chunk.js
+@@ -662,7 +662,7 @@
+                                     label: "NONE",
+                                     selected: () => null === w() && null === T(),
+                                     onClick: () => {
+-                                        n.setProp("selectedSubtitlesTrackId", null), n.setProp("selectedExtraSubtitlesTrackId", null)
++                                        window.__autoLang && window.__autoLang.markManualSubs(), n.setProp("selectedSubtitlesTrackId", null), n.setProp("selectedExtraSubtitlesTrackId", null)
+                                     }
+                                 }, ...k([...y(v()).map((({
+                                     id: e,
+@@ -675,7 +675,7 @@
+                                     tag: l,
+                                     selected: () => e === w(),
+                                     onClick: () => {
+-                                        n.setProp("selectedSubtitlesTrackId", e), n.setProp("selectedExtraSubtitlesTrackId", null), t.updateStream({
++                                        window.__autoLang && window.__autoLang.markManualSubs(), n.setProp("selectedSubtitlesTrackId", e), n.setProp("selectedExtraSubtitlesTrackId", null), t.updateStream({
+                                             subtitleTrack: {
+                                                 id: e,
+                                                 embedded: !0
+@@ -693,7 +693,7 @@
+                                     tag: l,
+                                     selected: () => e === T(),
+                                     onClick: () => {
+-                                        n.setProp("selectedExtraSubtitlesTrackId", e), n.setProp("selectedSubtitlesTrackId", null), t.updateStream({
++                                        window.__autoLang && window.__autoLang.markManualSubs(), n.setProp("selectedExtraSubtitlesTrackId", e), n.setProp("selectedSubtitlesTrackId", null), t.updateStream({
+                                             subtitleTrack: {
+                                                 id: e,
+                                                 embedded: !1
+@@ -772,7 +772,7 @@
+                             label: r,
+                             selected: () => n.state().selectedAudioTrackId === e,
+                             onClick: () => {
+-                                n.setProp("selectedAudioTrackId", e), t.updateStream({
++                                window.__autoLang && window.__autoLang.markManualAudio(), n.setProp("selectedAudioTrackId", e), t.updateStream({
+                                     audioTrack: {
+                                         id: e
+                                     }
+@@ -1240,7 +1240,7 @@
+                         } = T.state(), {
+                             transportUrl: o
+                         } = A.state();
+-                        e && o && C.load({
++                        e && o && window.__autoLang && window.__autoLang.beginLoad(e), e && o && C.load({
+                             platform: n.name,
+                             stream: e.stream,
+                             autoplay: !0,
+@@ -1271,6 +1271,7 @@
+                             subtitles: e
+                         } = T.state();
+                         e.length > 0 && C.addExtraSubtitlesTracks(e.map((e => ({ ...e,
++                            rawLabel: "string" == typeof e.label ? e.label : "",
+                             label: `${e.lang} (${e.origin})`
+                         }))))
+                     }
+@@ -1286,7 +1287,11 @@
+                         } = T.state(), l = (e, t) => e.find((({
+                             lang: e
+                         }) => b.eo.matches(e, t)));
+-                        if (!be())
++                        var __al = window.__autoLang, __subsPicked = !1;
++                        if (__al) {
++                            var __sp = __al.decideSubtitles($e(), _e(), e || t, null != o ? o.subtitleTrack : null);
++                            __sp && (__sp.extra ? C.selectExtraSubtitlesTrack(__sp.id) : C.selectSubtitlesTrack(__sp.id), __subsPicked = !0)
++                        } else if (!be())
+                             if (fe()) {
+                                 if (e) {
+                                     const t = l($e(), e),
+@@ -1309,13 +1314,16 @@
+                                 const {
+                                     id: e
+                                 } = o.audioTrack;
+-                                e && (C.selectAudioTrack(e), ye(!0))
++                                e && (C.selectAudioTrack(e), ye(!0), __al && __al.markManualAudio())
+                             } else if (null === Ve()) {
+-                            const e = n && l(Ge(), n),
++                            const __ai = __al && !__al.audioManual() ? __al.pickAudioIndex(Ge().map((function(x) {
++                                    return x.lang
++                                })), __al.audioPrefs()) : -1,
++                                e = __ai >= 0 ? Ge()[__ai] : n && l(Ge(), n),
+                                 t = r && l(Ge(), r);
+                             e ? (C.selectAudioTrack(e), ye(!0)) : t && (C.selectAudioTrack(t), ye(!0))
+                         }
+-                        de() || null !== e || null !== t || (C.disableSubtitlesTracks(), ce(!0))
++                        de() || null !== e || null !== t || (__subsPicked || C.disableSubtitlesTracks(), ce(!0))
+                     }
+                 })), (0, o.EH)((() => {
+                     var e, t, n, r, o;
+--- video.chunk.js
++++ video.chunk.js
+@@ -18779,7 +18779,11 @@
+                             try { __prefLang = (navigator.language || "").substring(0, 2); } catch(__e) {}
+                         }
+                         var __prefIdx = -1;
+-                        if (__prefLang) {
++                        if (window.__autoLang) {
++                            var __langs = [];
++                            for (var __al = 0; __al < d.audioTracks.length; __al++) __langs.push(d.audioTracks[__al].language || "");
++                            if (!window.__autoLang.audioManual()) __prefIdx = window.__autoLang.pickAudioIndex(__langs, window.__autoLang.audioPrefs(__prefLang));
++                        } else if (__prefLang) {
+                             for (var __ai = 0; __ai < d.audioTracks.length; __ai++) {
+                                 var __tl = d.audioTracks[__ai].language || "";
+                                 if (__tl === __prefLang || __tl.substring(0, 2) === __prefLang.substring(0, 2)) {
+@@ -21177,10 +21181,32 @@
+                             });
+                         }
+                         // Auto-select preferred audio language from Stremio settings
+-                        var prefLang = null;
++                        // Auto-select the title's original language (TMDB) first, then
++                        // the profile's audioLanguage (see autolang.js).
++                        var prefLang = null, prefIdx = -1, __al = window.__autoLang;
++                        if (__al) {
++                            var __langsOf = function() {
++                                return Array.from(A.audioTracks).map(function(e) { return e.language || ""; });
++                            };
++                            if (!__al.audioManual()) prefIdx = __al.pickAudioIndex(__langsOf(), __al.audioPrefs());
++                            if (__al.lookupPending()) {
++                                // TMDB answer not in yet: apply it when it arrives, unless the
++                                // user picked a track or the stream changed in the meantime.
++                                var __D = D;
++                                __al.onOriginalLang(function(lang) {
++                                    if (!lang || D !== __D || __al.audioManual() || !A.audioTracks || !A.audioTracks.length) return;
++                                    var __i2 = __al.pickAudioIndex(__langsOf(), [lang]), __cur = -1;
++                                    for (var __k = 0; __k < A.audioTracks.length; __k++) if (A.audioTracks[__k].enabled) __cur = __k;
++                                    if (__i2 >= 0 && __i2 !== __cur) {
++                                        V("selectedAudioTrackId", "EMBEDDED_" + __i2);
++                                        G("audioTracks"); G("selectedAudioTrackId");
++                                    }
++                                }, "webos-audio");
++                            }
++                        } else {
+                         try { prefLang = JSON.parse(localStorage.getItem("profile")).settings.audioLanguage; } catch(e) {}
+-                        var prefIdx = -1;
+-                        if (prefLang) {
++                        }
++                        if (!__al && prefLang) {
+                             for (var ai = 0; ai < A.audioTracks.length; ai++) {
+                                 var tl = A.audioTracks[ai].language || "";
+                                 if (tl === prefLang || tl.substring(0,2) === prefLang.substring(0,2)) {
